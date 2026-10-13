@@ -199,7 +199,9 @@ type Renderer struct {
 	surfaceFormat gputypes.TextureFormat
 
 	// Backend metadata
-	backendName string
+	backendName     string
+	backend         gputypes.Backend
+	presentedFrames uint64
 
 	// Submission tracker for non-blocking resource recycling.
 	tracker submissionTracker
@@ -385,6 +387,7 @@ func (r *Renderer) initAdapterDevice(surfaceHint *wgpu.Surface) error {
 		return fmt.Errorf("gogpu: failed to request adapter: %w", err)
 	}
 	info := r.adapter.Info()
+	r.backend = info.Backend
 	slog.Info("adapter selected", "name", info.Name, "backend", info.Backend, "type", info.DeviceType)
 	r.backendName = "Pure Go (" + info.Backend.String() + ")"
 
@@ -751,6 +754,9 @@ func (r *Renderer) endFrameForSurface(ws *RenderTarget) bool {
 	// The present's internal wl_surface.commit activates it atomically.
 	syncAttempt := syncFrameForPresent(ws)
 	reconfigured, presented := ws.present()
+	if presented {
+		r.presentedFrames++
+	}
 	finishPresentationSync(ws, syncAttempt, presented)
 	ws.releaseFrame()
 	r.endFrameStats(!presented)
@@ -771,6 +777,9 @@ func syncFrameForPresent(ws *RenderTarget) presentationSyncAttempt {
 	}
 	force := ws.presentationSyncRequested
 	if syncer, ok := ws.platWindow.(platform.PresentationSyncer); ok {
+		if !force && ws.renderer != nil && ws.renderer.backend == gputypes.BackendVulkan {
+			return presentationSyncAttempt{}
+		}
 		prepared := syncer.PrepareFrameSync(force)
 		if prepared {
 			markSecondaryFrameGatePending(ws)

@@ -403,6 +403,7 @@ func (r *ContextRenderTarget) WriteSurfacePixels(data []byte, width, height uint
 		return err
 	}
 	ws.pixelPresented = true
+	r.ctx.renderer.presentedFrames++
 	ws.discardFrameEncoder()
 	if ws.currentView != nil {
 		ws.currentView.Release()

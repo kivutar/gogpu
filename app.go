@@ -70,6 +70,7 @@ type App struct {
 	lifecycle              AppLifecycle // ADR-026 universal lifecycle state
 	quitOnLastWindowClosed bool         // default true — exit when last window closes
 	lastFrame              time.Time
+	frameSkipped           bool
 
 	// Event-driven rendering
 	invalidator   *Invalidator
@@ -479,6 +480,7 @@ func (a *App) startRunLoop() {
 // events when idle, processes platform events, ticks onUpdate, and draws
 // a frame when the three-mode state detection (ADR-023) calls for one.
 func (a *App) runFrame() {
+	a.inputEvents = a.inputEvents[:0]
 	continuousRender := a.config.ContinuousRender
 	animating := a.animations.IsAnimating()
 	invalidated := a.invalidator.Consume()
@@ -491,6 +493,16 @@ func (a *App) runFrame() {
 	// Process all pending platform events.
 	// Events may call RequestRedraw() which sets invalidated for next check.
 	a.processEventsMultiThread()
+
+	deadline := a.lastFrame.Add(50 * time.Millisecond)
+	for continuousRender && runtime.GOOS != "js" &&
+		(a.frameSkipped || !a.frameCallbackReady()) && time.Now().Before(deadline) {
+		a.waitForEventsUntil(deadline)
+		a.processEventsMultiThread()
+		if !a.running.Load() || (a.platWindow != nil && a.platWindow.ShouldClose()) {
+			return
+		}
+	}
 
 	// Check if invalidation arrived during event processing
 	// (e.g., resize or UI framework responding to hover/click).
@@ -534,8 +546,25 @@ func (a *App) runFrame() {
 	// OnDraw: CONTINUOUS = every VSync (games), otherwise only when dirty.
 	// ANIMATING mode: onUpdate runs every tick, OnDraw only on RequestRedraw.
 	// Lazy acquire inside: if OnDraw doesn't draw, no swapchain acquire.
+	a.frameSkipped = true
 	if (continuousRender || invalidated) && a.frameCallbackReady() {
-		a.renderFrameMultiThread()
+		a.frameSkipped = !a.renderFrameMultiThread()
+	}
+}
+
+func (a *App) waitForEventsUntil(deadline time.Time) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+	done := make(chan struct{})
+	timer := time.AfterFunc(remaining, func() {
+		a.manager.WakeUp()
+		close(done)
+	})
+	a.manager.WaitEvents()
+	if !timer.Stop() {
+		<-done
 	}
 }
 
@@ -738,9 +767,6 @@ func (a *App) initRenderer(platWindow platform.PlatformWindow) error {
 // This matches the winit/Flutter/Qt pattern: platform layer delivers events,
 // handlers decide whether to invalidate, render loop never guesses.
 func (a *App) processEventsMultiThread() {
-	// Reset public input event queue (ADR-058). Reuse backing array.
-	a.inputEvents = a.inputEvents[:0]
-
 	// Collect all events first, then process.
 	// This allows us to coalesce resize events.
 	var lastResize *platform.Event
@@ -1021,7 +1047,7 @@ func (a *App) registerPrimaryWindow(platWindow platform.PlatformWindow) {
 // When multiple windows are open, each window with an onDraw callback gets
 // its own beginFrame/draw/endFrame cycle. GPU submission polling happens once
 // after all windows are presented.
-func (a *App) renderFrameMultiThread() {
+func (a *App) renderFrameMultiThread() bool {
 	// Collect visible windows with their main-thread state.
 	a.windowManager.mu.RLock()
 	frames := make([]windowFrame, 0, len(a.windowManager.order))
@@ -1055,15 +1081,17 @@ func (a *App) renderFrameMultiThread() {
 	a.windowManager.mu.RUnlock()
 
 	if len(frames) == 0 {
-		return
+		return false
 	}
 
+	previous := a.renderer.presentedFrames
 	// Execute GPU operations on render thread.
 	a.renderLoop.RunOnRenderThreadVoid(func() {
 		runInFramePool(func() {
 			a.renderFrameGPU(frames)
 		})
 	})
+	return a.renderer.presentedFrames != previous
 }
 
 // renderFrameGPU performs GPU work for all visible windows.
